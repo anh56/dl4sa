@@ -5,10 +5,4 @@ services:
       dockerfile: ./Dockerfile
     volumes:
       - .:/ml
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [ gpu ]
+
