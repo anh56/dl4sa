@@ -1,10 +1,10 @@
-This folder contains the implementation for LR, SVM, KNN, RF, XGB and LSTM.
+This folder contains the implementation for ReGVD (GGNN, GCN) and Devign (GGNN).
 Make sure the data is available in the `data` folder. 
 To run:
 - Using Docker Compose:
   - ```bash
     docker compose up -d
-    docker compose exec ml bash
+    docker compose exec dl bash
     ./run.sh
     ```
     
@@ -20,4 +20,3 @@ To run:
     pip install -r requirements.txt
     ./run.sh
     ```
-

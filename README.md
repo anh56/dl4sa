@@ -6,7 +6,7 @@ This repository contains the data and scripts used in the paper "Automated Code-
 The repository is organized as follows:
 - `data`: Contains the data used in the paper.
 - `ml`: Contains the code for the machine models.
-- `dl`: Contains the code for the deep learning models, with two versions:
+- `dl`: Contains the code for the deep learning models, with two versions for each model type (graph and non-graph):
   - `mutliclass`: the original models.
   - `multitask`: modified models that support multitask.
 

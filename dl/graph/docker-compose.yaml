@@ -1,0 +1,16 @@
+services:
+  regvd:
+    build: .
+    image: graph:latest
+    ports:
+      - "8265:8265"
+    volumes:
+      - .:/dl/graph/
+      - ../../data:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
