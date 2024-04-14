@@ -12,9 +12,7 @@ The repository is organized as follows:
 
 
 ## Requirements
-The code can either be run by using Docker/ Docker Compose or by installing the required dependencies manually. 
-
-If you are installing it locally, the dependencies required to run the code can be found in the `requirements.txt` file for each model.
+The dependencies required to run the code can be found in the `requirements.txt` file for each model type.
 
 
 ## Data

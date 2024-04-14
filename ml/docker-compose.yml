@@ -1,8 +1,0 @@
-services:
-  ml:
-    build:
-      context: .
-      dockerfile: ./Dockerfile
-    volumes:
-      - .:/ml
-

@@ -10,24 +10,6 @@ The models use JSONL format, so additional conversion is needed if csv file is p
 Or use the data directly from [here](https://drive.google.com/drive/folders/17zrM4V9b8eOuc9-2SC90hF8I72siTpyc?usp=sharing)
 
 To run using sample settings:
-
-- Using Docker Compose:
-```bash
-    docker compose up -d
-    docker compose exec dl bash
-    cd /graph/multiclass
-    ./run.sh
-  ```
-
-- Using Docker:
-```bash
-    docker build -t ml .
-    docker run -it ml bash
-    cd /graph/multiclass
-    ./run.sh
-```
-
-- Locally:
 ```bash
     pip install -r requirements.txt
     cd /graph/multiclass 

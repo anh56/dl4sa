@@ -1,21 +1,7 @@
 This folder contains the implementation for LR, SVM, KNN, RF, XGB and LSTM.
 Make sure the data is available in the `data` folder. 
-To run:
-- Using Docker Compose:
-  - ```bash
-    docker compose up -d
-    docker compose exec ml bash
-    ./run.sh
-    ```
-    
-- Using Docker:
-  - ```bash
-    docker build -t ml .
-    docker run -it ml bash
-    ./run.sh
-    ```
-  
-- Locally:
+To run with sample settings:
+
   - ```bash
     pip install -r requirements.txt
     ./run.sh
