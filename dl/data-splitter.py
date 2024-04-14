@@ -2,11 +2,11 @@ import pandas as pd
 import json
 import numpy as np
 
-data_file_path = "../../data/MSR_data_cleaned.csv"
-json_out_file_path = "./input/msr.json"
-train_idxs_out_file = "./input/train_msr.txt"
-test_idxs_out_file = "./input/test_msr.txt"
-valid_idxs_out_file = "./input/valid_msr.txt"
+data_file_path = "../../data/msr_vul.csv"
+json_out_file_path = "../input/msr.json"
+train_idxs_out_file = "input/train_msr.txt"
+test_idxs_out_file = "input/test_msr.txt"
+valid_idxs_out_file = "input/valid_msr.txt"
 
 
 # Access Gained,Attack Origin,Authentication Required,Availability,CVE ID,CVE Page,CWE ID,Complexity,Confidentiality,Integrity,Known Exploits,Publish Date,Score,Summary,Update Date,Vulnerability Classification,add_lines,codeLink,commit_id,commit_message,del_lines,file_name,files_changed,func_after,func_before,lang,lines_after,lines_before,parentID,patch,project,project_after,project_before,vul,vul_func_with_fix

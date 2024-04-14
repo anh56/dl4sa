@@ -19,7 +19,7 @@ If you are installing it locally, the dependencies required to run the code can 
 
 ## Data
 Due to large size, the data is not included in the repository.
-The data can be downloaded from the following link: [data]()
+The data can be downloaded from the following link: [data](https://drive.google.com/drive/folders/17zrM4V9b8eOuc9-2SC90hF8I72siTpyc?usp=sharing)
 and put into the `data` folder.
 
 

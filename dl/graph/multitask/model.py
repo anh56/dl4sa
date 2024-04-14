@@ -5,33 +5,11 @@ from utils import *
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class Model(nn.Module):
-    def __init__(self, encoder, config, tokenizer, args):
-        super(Model, self).__init__()
-        self.encoder = encoder
-        self.config = config
-        self.tokenizer = tokenizer
-        self.args = args
-
-    def forward(self, input_ids=None, labels=None):
-        outputs = self.encoder(input_ids, attention_mask=input_ids.ne(1))[0]
-        logits = outputs
-        prob = F.sigmoid(logits)
-        if labels is not None:
-            labels = labels.float()
-            loss = torch.log(prob[:, 0] + 1e-10) * labels + torch.log((1 - prob)[:, 0] + 1e-10) * (1 - labels)
-            loss = -loss.mean()
-            return loss, prob
-        else:
-            return prob
-
-
-class MulticlassPredictionClassification(nn.Module):
-    """Head for sentence-level classification tasks."""
-
+# change the head classifier to a custom one to support multitask
+class MultitaskPredictionClassification(nn.Module):
     def __init__(
-        self, tune_params, config, args, input_size=None,
-        num_labels_per_category=[3, 3, 2, 3, 3, 3, 3]
+            self, tune_params, config, args, input_size=None,
+            num_labels_per_category: list[int] = [3, 3, 2, 3, 3, 3, 3]
     ):
         super().__init__()
         if input_size is None:
@@ -45,15 +23,43 @@ class MulticlassPredictionClassification(nn.Module):
             ]
         )
 
-    def forward(self, features):  #
+    def forward(self, features):
         x = features
         x = self.dropout(x)
         x = self.dense(x.float())
         x = torch.tanh(x)
         x = self.dropout(x)
-        # get logits for each category
         logits = [layer(x) for layer in self.out_proj]
         return logits
+
+
+class Model(nn.Module):
+    def __init__(self, tune_params, encoder, config, tokenizer, args):
+        super(Model, self).__init__()
+        self.encoder = encoder
+        self.config = config
+        self.tokenizer = tokenizer
+        self.args = args
+        self.classifier = MultitaskPredictionClassification(tune_params, config, args)
+
+    def forward(self, input_ids=None, labels_list=None):
+        # https://huggingface.co/docs/transformers/main_classes/output#transformers.modeling_outputs.SequenceClassifierOutput.logits
+        logits = self.encoder(
+            input_ids,
+            attention_mask=input_ids.ne(1)
+        ).logits
+        logits = self.classifier(logits)
+        prob = [torch.softmax(logit) for logit in logits]
+
+        if labels_list is not None:
+            loss = 0
+            for logit, labels in zip(logits, labels_list):
+                loss_fct = nn.BCEWithLogitsLoss()
+                num_labels = logit.shape[-1]
+                loss += loss_fct(logit.view(-1, num_labels), labels.view(-1, num_labels))
+            return loss, prob
+        else:
+            return prob
 
 
 class GNNReGVD(nn.Module):
@@ -67,21 +73,25 @@ class GNNReGVD(nn.Module):
         self.w_embeddings = self.encoder.roberta.embeddings.word_embeddings.weight.data.cpu().detach().clone().numpy()
         self.tokenizer = tokenizer
         if args.gnn == "ReGGNN":
-            self.gnn = ReGGNN(feature_dim_size=args.feature_dim_size,
-                              hidden_size=tune_params["hidden_size"],
-                              num_GNN_layers=tune_params["num_GNN_layers"],
-                              dropout=config.hidden_dropout_prob,
-                              residual=not args.remove_residual,
-                              att_op=tune_params["att_op"])
+            self.gnn = ReGGNN(
+                feature_dim_size=args.feature_dim_size,
+                hidden_size=tune_params["hidden_size"],
+                num_GNN_layers=tune_params["num_GNN_layers"],
+                dropout=config.hidden_dropout_prob,
+                residual=not args.remove_residual,
+                att_op=tune_params["att_op"]
+            )
         else:
-            self.gnn = ReGCN(feature_dim_size=args.feature_dim_size,
-                             hidden_size=tune_params["hidden_size"],
-                             num_GNN_layers=tune_params["num_GNN_layers"],
-                             dropout=config.hidden_dropout_prob,
-                             residual=not args.remove_residual,
-                             att_op=tune_params["att_op"])
+            self.gnn = ReGCN(
+                feature_dim_size=args.feature_dim_size,
+                hidden_size=tune_params["hidden_size"],
+                num_GNN_layers=tune_params["num_GNN_layers"],
+                dropout=config.hidden_dropout_prob,
+                residual=not args.remove_residual,
+                att_op=tune_params["att_op"]
+            )
         gnn_out_dim = self.gnn.out_dim
-        self.classifier = MulticlassPredictionClassification(
+        self.classifier = MultitaskPredictionClassification(
             tune_params,
             config,
             args,
@@ -112,7 +122,7 @@ class GNNReGVD(nn.Module):
         outputs = self.gnn(adj_feature.to(device).double(), adj.to(device).double(), adj_mask.to(device).double())
 
         logits = self.classifier(outputs)  # logits is a list of tensors
-        prob = [torch.sigmoid(logit) for logit in logits]
+        prob = [torch.softmax(logit) for logit in logits]
 
         if labels_list is not None:
             loss = 0
@@ -137,12 +147,13 @@ class DevignModel(nn.Module):
         self.w_embeddings = self.encoder.roberta.embeddings.word_embeddings.weight.data.cpu().detach().clone().numpy()
         self.tokenizer = tokenizer
 
-        self.gnn = GGGNN(feature_dim_size=args.feature_dim_size,
-                         hidden_size=tune_params["hidden_size"],
-                         num_GNN_layers=tune_params["num_GNN_layers"],
-                         # num_classes=args.num_classes,
-                         dropout=config.hidden_dropout_prob
-                         )
+        self.gnn = GGGNN(
+            feature_dim_size=args.feature_dim_size,
+            hidden_size=tune_params["hidden_size"],
+            num_GNN_layers=tune_params["num_GNN_layers"],
+            # num_classes=args.num_classes,
+            dropout=config.hidden_dropout_prob
+        )
 
         self.conv_l1 = torch.nn.Conv1d(tune_params["hidden_size"], tune_params["hidden_size"], 3).double()
         self.maxpool1 = torch.nn.MaxPool1d(3, stride=2).double()
@@ -205,7 +216,7 @@ class DevignModel(nn.Module):
             avg = before_avg.mean(dim=1)
             logits.append(avg)
 
-        prob = [torch.sigmoid(logit) for logit in logits]
+        prob = [torch.softmax(logit) for logit in logits]
 
         if labels_list is not None:
             loss = 0

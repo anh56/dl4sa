@@ -20,4 +20,7 @@ To run:
     pip install -r requirements.txt
     ./run.sh
     ```
+    
+
+This code is partially based on https://github.com/lhmtriet/Function-level-Vulnerability-Assessment
 

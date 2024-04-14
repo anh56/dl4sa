@@ -404,7 +404,7 @@ def main(granularity, cvss_col, feature):
 
     key_col = 'key'
 
-    data_folder = 'data/'
+    data_folder = '../data/'
 
     data_col = 'code'
     filename = data_folder + 'data.csv'

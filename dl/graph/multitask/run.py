@@ -5,22 +5,26 @@ import time
 import argparse
 import logging
 import os
-from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler
+import random
+import re
+import shutil
+import numpy as np
+import scipy
+import torch
+from neptune.utils import stringify_unsupported
+from sklearn import metrics
+from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 import json
-from sklearn import metrics
-
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except:
-    from tensorboardX import SummaryWriter
-
+from tqdm import tqdm, trange
 import multiprocessing
 from model import *
 import ray
 from ray import tune
 from ray import train as ray_train
 from ray.tune.schedulers import ASHAScheduler
+import neptune
+from neptune_pytorch import NeptuneLogger
 
 cpu_cont = multiprocessing.cpu_count()
 from transformers import (
@@ -42,7 +46,7 @@ MODEL_CLASSES = {
     'distilbert': (DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer)
 }
 
-# enable if
+# enable ray
 ray.init(
     num_gpus=1,
     # dashboard_port=8265,
@@ -51,24 +55,15 @@ ray.init(
 )
 
 
-def warn(*args, **kwargs):
-    pass
-
-
-import warnings
-
-warnings.warn = warn
-
-
 class InputFeatures(object):
     """A single training/test features for an example."""
 
     def __init__(
-        self,
-        input_tokens,
-        input_ids,
-        idx,
-        label,
+            self,
+            input_tokens,
+            input_ids,
+            idx,
+            label,
     ):
         self.input_tokens = input_tokens
         self.input_ids = input_ids
@@ -76,13 +71,13 @@ class InputFeatures(object):
         self.label = label
 
 
-class MulticlassInputFeatures(object):
+class MultitaskInputFeatures(object):
     def __init__(
-        self,
-        input_tokens,
-        input_ids,
-        idx,
-        labels,
+            self,
+            input_tokens,
+            input_ids,
+            idx,
+            labels,
     ):
         self.input_tokens = input_tokens
         self.input_ids = input_ids
@@ -99,18 +94,18 @@ def convert_examples_to_features(js, tokenizer, args):
     padding_length = args.block_size - len(source_ids)
     source_ids += [tokenizer.pad_token_id] * padding_length
 
-    num_labels_per_class = [3, 3, 2, 3, 3, 3, 3]  # specify the number of labels for each class
+    # specify the number of labels for each class
+    # authentication only have 2 labels
+    num_labels_per_class = [3, 3, 2, 3, 3, 3, 3]
     labels = [torch.zeros(num_labels) for num_labels in num_labels_per_class]
-
     target_cols = ["access_vector", "access_complexity", "authentication",
                    "confidentiality", "integrity", "availability", "severity"]
 
     for idx, col in enumerate(target_cols):
         label: int = int(js[col])
-        # one hot encode
         labels[idx][label] = 1
 
-    return MulticlassInputFeatures(
+    return MultitaskInputFeatures(
         source_tokens,
         source_ids,
         js['idx'],
@@ -156,25 +151,12 @@ class TextDataset(Dataset):
 
 
 def eval_metrics_per_class(
-    run, npt_logger, log_neptune, namespace, accs, precs, recs, f1s, f1_macros, mccs
+        run, npt_logger, log_neptune, namespace, accs, precs, recs, f1s, f1_macros, mccs
 ):
     target_cols = [
         "access_vector", "access_complexity", "authentication",
         "confidentiality", "integrity", "availability", "severity"
     ]
-
-    # def __init__(self, labels, preds):
-    #     labels = [[np.argmax(l) for l in label] for label in labels]
-    #     preds = [[np.argmax(p) for p in pred] for pred in preds]
-    #     self.t_labels = list(map(list, zip(*labels)))
-    #     self.t_preds = list(map(list, zip(*preds)))
-
-    # for i, col in enumerate(target_cols):
-    #     acc = metrics.accuracy_score(t_labels[i], t_preds[i])
-    #     prec = metrics.precision_score(t_labels[i], t_preds[i], average="macro")
-    #     rec = metrics.recall_score(t_labels[i], t_preds[i], average="macro")
-    #     f1_macro = metrics.f1_score(t_labels[i], t_preds[i], average="macro")
-    #     mcc = metrics.matthews_corrcoef(t_labels[i], t_preds[i])
 
     if run and npt_logger and log_neptune:
         for i, col in enumerate(target_cols):
@@ -200,10 +182,11 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
     """ Train the model """
 
     if args.model == "devign":
-        print("Using devign")
         model = DevignModel(tune_params, model, config, tokenizer, args)
-    else:  # GNNs
+    else:
         model = GNNReGVD(tune_params, model, config, tokenizer, args)
+    print(model)
+    model.to(args.device)
 
     if log_neptune:
         run['args'] = args
@@ -222,8 +205,13 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
 
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler,
-                                  batch_size=args.train_batch_size, num_workers=4, pin_memory=True)
+    train_dataloader = DataLoader(
+        train_dataset,
+        sampler=train_sampler,
+        batch_size=args.train_batch_size,
+        num_workers=4,
+        pin_memory=True
+    )
     logger.info(f"Data loader len {len(train_dataloader)}")
     args.max_steps = args.epoch * len(train_dataloader)
     args.save_steps = len(train_dataloader)
@@ -247,63 +235,27 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
         num_training_steps=args.max_steps
     )
 
-    if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
-
-    # multi-gpu training (should be after apex fp16 initialization)
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
-
-    # Distributed training (should be after apex fp16 initialization)
-    if args.local_rank != -1:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.local_rank],
-            output_device=args.local_rank,
-            find_unused_parameters=True
-        )
-
-    checkpoint_last = os.path.join(args.output_dir, 'checkpoint-last')
-    scheduler_last = os.path.join(checkpoint_last, 'scheduler.pt')
-    optimizer_last = os.path.join(checkpoint_last, 'optimizer.pt')
-    if os.path.exists(scheduler_last):
-        scheduler.load_state_dict(torch.load(scheduler_last))
-    if os.path.exists(optimizer_last):
-        optimizer.load_state_dict(torch.load(optimizer_last))
     # Train!
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_dataset))
     logger.info("  Num Epochs = %d", args.num_train_epochs)
-    logger.info("  Instantaneous batch size per GPU = %d", args.per_gpu_train_batch_size)
-    logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
-                args.train_batch_size * args.gradient_accumulation_steps * (
-                    torch.distributed.get_world_size() if args.local_rank != -1 else 1))
-    logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+    logger.info("  batch size = %d", args.train_batch_size)
     logger.info("  Total optimization steps = %d", args.max_steps)
 
     global_step = args.start_step
     tr_loss, logging_loss, avg_loss, tr_nb, tr_num, train_loss = 0.0, 0.0, 0.0, 0, 0, 0
 
     metrics_es = f"eval_{args.early_stopping_metric}"
-    best_metrics_es = 0.0
-    # model.resize_token_embeddings(len(tokenizer))
+    best_metrics_es = -1.0
     model.zero_grad()
 
     early_stopping_count = 0
     max_early_stopping_count_epoch = args.max_early_stopping
-    # max_early_stopping_count_batch = 100
 
     for idx in range(args.start_epoch, int(args.num_train_epochs)):
         logger.info(f"Starting epoch {idx}")
-        # early_stopping_count_batch = 0
-
-        # bar = tqdm(train_dataloader,total=len(train_dataloader))
         tr_num = 0
         train_loss = 0
-        # for step, batch in enumerate(bar):
         for step, batch in enumerate(train_dataloader):
             if step % 100 == 0:
                 logger.info(f"      Starting batch {step} processing")
@@ -311,21 +263,15 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
             # labels = batch[1].to(args.device)
             # change to a list of labels
             labels_list = [label.to(args.device) for label in batch[1]]
+
             model.train()
             loss, logits = model(inputs, labels_list)
 
-            if args.n_gpu > 1:
-                loss = loss.mean()  # mean() to average on multi-gpu parallel training
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
             tr_num += 1
@@ -333,9 +279,6 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
             if avg_loss == 0:
                 avg_loss = tr_loss
             avg_loss = round(train_loss / tr_num, 5)
-
-            # bar.set_description("epoch {} loss {}".format(idx, avg_loss))
-            # logger.info("epoch {} loss {}".format(idx, avg_loss))
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if global_step % 100 == 0:
@@ -345,7 +288,6 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
                 optimizer.zero_grad()
                 scheduler.step()
                 global_step += 1
-                output_flag = True
 
                 avg_loss = round(np.exp((tr_loss - logging_loss) / (global_step - tr_nb)), 4)
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
@@ -366,6 +308,7 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
 
         for key, value in results_epoch.items():
             logger.info("  %s = %s", key, round(value, 4))
+
             # Save model checkpoint
 
         logger.info("  " + "*" * 20)
@@ -401,14 +344,13 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
                 logger.info(f"  Current best {metrics_es} over epochs {best_metrics_es}")
                 break
         logger.info("  " + "*" * 20)
-        checkpoint_prefix = f'checkpoint-best-{args.early_stopping_metric}/model.bin'
         ray_train.report(
             {f"{args.early_stopping_metric}": results_epoch[metrics_es]},
         )
         print("Finished Training")
     # Evaluation
     results = {}
-    if args.do_eval and args.local_rank in [-1, 0]:
+    if args.do_eval:
         checkpoint_prefix = f'checkpoint-best-{args.early_stopping_metric}/model.bin'
         output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
         model.load_state_dict(torch.load(output_dir))
@@ -418,7 +360,7 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
         for key in sorted(result.keys()):
             logger.info("  %s = %s", key, str(round(result[key], 4)))
 
-    if args.do_test and args.local_rank in [-1, 0]:
+    if args.do_test:
         checkpoint_prefix = f'checkpoint-best-{args.early_stopping_metric}/model.bin'
         output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
         model.load_state_dict(torch.load(output_dir))
@@ -431,17 +373,18 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
             logger.info("  %s = %s", key, str(round(test_result[key], 4)))
 
 
-def evaluate(args, model, tokenizer, eval_when_training=False, run=None, npt_logger=None, log_neptune=False,
-             stage="batch"):
+def evaluate(
+        args, model, tokenizer,
+        eval_when_training=False, run=None, npt_logger=None, log_neptune=False, stage="batch"
+):
     eval_output_dir = args.output_dir
 
     eval_dataset = TextDataset(tokenizer, args, args.eval_data_file)
 
-    if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
+    if not os.path.exists(eval_output_dir):
         os.makedirs(eval_output_dir)
 
-    args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-    eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
+    eval_sampler = SequentialSampler(eval_dataset)
     eval_dataloader = DataLoader(
         eval_dataset,
         sampler=eval_sampler,
@@ -450,10 +393,6 @@ def evaluate(args, model, tokenizer, eval_when_training=False, run=None, npt_log
         pin_memory=True
     )
 
-    # multi-gpu evaluate
-    if args.n_gpu > 1 and eval_when_training is False:
-        model = torch.nn.DataParallel(model)
-
     # Eval!
     logger.info("***** Running evaluation *****")
     logger.info("  Num examples = %d", len(eval_dataset))
@@ -461,7 +400,6 @@ def evaluate(args, model, tokenizer, eval_when_training=False, run=None, npt_log
     eval_loss = 0.0
     nb_eval_steps = 0
     model.eval()
-
     logits = [[] for _ in range(7)]
     labels = [[] for _ in range(7)]
 
@@ -478,19 +416,17 @@ def evaluate(args, model, tokenizer, eval_when_training=False, run=None, npt_log
     logits = [np.concatenate(logit) for logit in logits]
     labels = [np.concatenate(label) for label in labels]
 
-    # Convert logits to probabilities
     probs = [scipy.special.softmax(logit, axis=1) for logit in logits]
 
     # Apply threshold
     preds = [(prob >= np.max(prob, axis=1, keepdims=True)).astype(int) for prob in probs]
 
+    eval_loss = eval_loss / nb_eval_steps
+    perplexity = torch.tensor(eval_loss)
     eval_acc = np.mean([
         metrics.accuracy_score(labels[i], preds[i])
         for i in range(len(logits))
     ])
-
-    eval_loss = eval_loss / nb_eval_steps
-    perplexity = torch.tensor(eval_loss)
 
     accs = [
         metrics.accuracy_score(true, pred)
@@ -511,7 +447,7 @@ def evaluate(args, model, tokenizer, eval_when_training=False, run=None, npt_log
     eval_recall = np.mean(recs)
 
     f1s = [
-        metrics.f1_score(true, pred, average="samples")
+        metrics.f1_score(true, pred)
         for true, pred in zip(labels, preds)]
     eval_f1 = np.mean(f1s)
 
@@ -520,8 +456,6 @@ def evaluate(args, model, tokenizer, eval_when_training=False, run=None, npt_log
         for true, pred in zip(labels, preds)]
     eval_f1_macro = np.mean(f1_macros)
 
-    # multilabel-indicator is not supported
-    # need convert back to class label
     mcc_labels = [label.argmax(axis=1) for label in labels]
     mcc_preds = [pred.argmax(axis=1) for pred in preds]
 
@@ -538,8 +472,8 @@ def evaluate(args, model, tokenizer, eval_when_training=False, run=None, npt_log
         "eval_precision": eval_precision,
         "eval_recall": eval_recall,
         "eval_f1": eval_f1,
-        "eval_macro_f1": eval_f1,
-        "eval_mcc": eval_mcc
+        "eval_f1_macro": eval_f1_macro,
+        "eval_mcc": eval_mcc,
     }
 
     if run and npt_logger and log_neptune:
@@ -568,21 +502,29 @@ def evaluate(args, model, tokenizer, eval_when_training=False, run=None, npt_log
                 run, npt_logger, log_neptune, "eval",
                 accs, precs, recs, f1s, f1_macros, mccs
             )
+
+    target_cols = [
+        "access_vector", "access_complexity", "authentication",
+        "confidentiality", "integrity", "availability", "severity"
+    ]
+    # since the order is ensured, we can get the corresponding result by idx
+    for i, col in enumerate(target_cols):
+        result.update({
+            f"eval_acc_metric_{col}": accs[i],
+            f"eval_precision_{col}": precs[i],
+            f"eval_recall_{col}": recs[i],
+            f"eval_f1_{col}": f1s[i],
+            f"eval_f1_macro_{col}": f1_macros[i],
+            f"eval_mcc_{col}": mccs[i],
+        })
+
     return result
 
 
 def test(args, model, tokenizer, run=None, npt_logger=None, log_neptune=False):
-    # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_dataset = TextDataset(tokenizer, args, args.test_data_file)
-
-    args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-    # Note that DistributedSampler samples randomly
-    eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
+    eval_sampler = SequentialSampler(eval_dataset)
     eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
-
-    # multi-gpu evaluate
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
 
     # Eval!
     logger.info("***** Running Test *****")
@@ -595,7 +537,7 @@ def test(args, model, tokenizer, run=None, npt_logger=None, log_neptune=False):
     logits = [[] for _ in range(7)]
     labels = [[] for _ in range(7)]
 
-    for batch in eval_dataloader:
+    for batch in tqdm(eval_dataloader, total=len(eval_dataloader)):
         inputs = batch[0].to(args.device)
         labels_list = [label.to(args.device) for label in batch[1]]
         with torch.no_grad():
@@ -638,7 +580,7 @@ def test(args, model, tokenizer, run=None, npt_logger=None, log_neptune=False):
     test_recall = np.mean(recs)
 
     f1s = [
-        metrics.f1_score(true, pred, average="samples")
+        metrics.f1_score(true, pred)
         for true, pred in zip(labels, preds)]
     test_f1 = np.mean(f1s)
 
@@ -648,8 +590,6 @@ def test(args, model, tokenizer, run=None, npt_logger=None, log_neptune=False):
     ]
     test_f1_macro = np.mean(f1_macros)
 
-    # multilabel-indicator is not supported
-    # need convert back to class label
     mcc_labels = [label.argmax(axis=1) for label in labels]
     mcc_preds = [pred.argmax(axis=1) for pred in preds]
 
@@ -661,7 +601,7 @@ def test(args, model, tokenizer, run=None, npt_logger=None, log_neptune=False):
 
     with open(os.path.join(args.output_dir, "predictions.txt"), 'w') as f:
         for example, pred in zip(
-            eval_dataset.examples, zip(*preds)
+                eval_dataset.examples, zip(*preds)
         ):  # Unpack preds so each pred is a tuple of class predictions
             class_labels = [np.argmax(p) for p in pred]
             f.write(f"{example.idx},{','.join(map(str, class_labels))}\n")  # Write example id and all class predictions
@@ -689,6 +629,21 @@ def test(args, model, tokenizer, run=None, npt_logger=None, log_neptune=False):
             accs, precs, recs, f1s, f1_macros, mccs
         )
 
+    target_cols = [
+        "access_vector", "access_complexity", "authentication",
+        "confidentiality", "integrity", "availability", "severity"
+    ]
+    # since the order is ensured, we can get the corresponding result by idx
+    for i, col in enumerate(target_cols):
+        result.update({
+            f"test_acc_metric_{col}": accs[i],
+            f"test_precision_{col}": precs[i],
+            f"test_recall_{col}": recs[i],
+            f"test_f1_{col}": f1s[i],
+            f"test_f1_macro_{col}": f1_macros[i],
+            f"test_mcc_{col}": mccs[i],
+        })
+
     return result
 
 
@@ -706,7 +661,6 @@ def main():
                         help="An optional input evaluation data file to evaluate the perplexity on (a text file).")
     parser.add_argument("--test_data_file", default="../input/test.jsonl", type=str,
                         help="An optional input evaluation data file to evaluate the perplexity on (a text file).")
-
     parser.add_argument("--model_type", default="roberta", type=str,
                         help="The model architecture to be fine-tuned.")
     parser.add_argument("--model_name_or_path", default="microsoft/codebert-base", type=str,
@@ -727,59 +681,26 @@ def main():
                         help="Whether to run eval on the dev set.")
     parser.add_argument("--do_test", action='store_true',
                         help="Whether to run eval on the dev set.")
-    parser.add_argument("--evaluate_during_training", action='store_true',
-                        help="Run evaluation during training at each logging step.")
-    parser.add_argument("--do_lower_case", action='store_true',
-                        help="Set this flag if you are using an uncased model.")
     parser.add_argument("--train_batch_size", default=4, type=int,
                         help="Batch size per GPU/CPU for training.")
     parser.add_argument("--eval_batch_size", default=4, type=int,
                         help="Batch size per GPU/CPU for evaluation.")
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
-                        help="Number of updates steps to accumulate before performing a backward/update pass.")
     # parser.add_argument("--learning_rate", default=5e-5, type=float,
     #                     help="The initial learning rate for Adam.")
-    parser.add_argument("--weight_decay", default=0.0, type=float,
-                        help="Weight decay if we apply some.")
+    # parser.add_argument("--weight_decay", default=0.0, type=float,
+    #                     help="Weight decay if we apply some.")
     # parser.add_argument("--adam_epsilon", default=1e-8, type=float,
     #                     help="Epsilon for Adam optimizer.")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float,
-                        help="Max gradient norm.")
+    # parser.add_argument("--max_grad_norm", default=1.0, type=float,
+    #                     help="Max gradient norm.")
     parser.add_argument("--num_train_epochs", default=1.0, type=float,
                         help="Total number of training epochs to perform.")
     parser.add_argument("--max_steps", default=-1, type=int,
                         help="If > 0: set total number of training steps to perform. Override num_train_epochs.")
-    parser.add_argument("--warmup_steps", default=0, type=int,
-                        help="Linear warmup over warmup_steps.")
-
-    parser.add_argument('--logging_steps', type=int, default=1,
-                        help="Log every X updates steps.")
-    parser.add_argument('--save_steps', type=int, default=5,
-                        help="Save checkpoint every X updates steps.")
-    parser.add_argument('--save_total_limit', type=int, default=None,
-                        help='Limit the total amount of checkpoints, delete the older checkpoints in the output_dir, does not delete by default')
-    parser.add_argument("--eval_all_checkpoints", action='store_true',
-                        help="Evaluate all checkpoints starting with the same prefix as model_name_or_path ending and ending with step number")
-    parser.add_argument("--no_cuda", action='store_true',
-                        help="Avoid using CUDA when available")
-    parser.add_argument('--overwrite_output_dir', action='store_true',
-                        help="Overwrite the content of the output directory")
-    parser.add_argument('--overwrite_cache', action='store_true',
-                        help="Overwrite the cached training and evaluation sets")
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
     parser.add_argument('--epoch', type=int, default=42,
                         help="random seed for initialization")
-    parser.add_argument('--fp16', action='store_true',
-                        help="Whether to use 16-bit (mixed) precision (through NVIDIA apex) instead of 32-bit")
-    parser.add_argument('--fp16_opt_level', type=str, default='O1',
-                        help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
-                             "See details at https://nvidia.github.io/apex/amp.html")
-    parser.add_argument("--local_rank", type=int, default=-1,
-                        help="For distributed training: local_rank")
-    parser.add_argument('--server_ip', type=str, default='', help="For distant debugging.")
-    parser.add_argument('--server_port', type=str, default='', help="For distant debugging.")
-
     parser.add_argument("--model", default="GNNs", type=str, help="")
     # parser.add_argument("--hidden_size", default=256, type=int,
     #                     help="hidden size.")
@@ -787,23 +708,24 @@ def main():
     #                     help="feature dim size.")
     # parser.add_argument("--num_GNN_layers", default=2, type=int,
     #                     help="num GNN layers.")
-    parser.add_argument("--num_classes", default=2, type=int,
-                        help="num classes.")
+    # parser.add_argument("--num_classes", default=2, type=int,
+    #                     help="num classes.")
     parser.add_argument("--gnn", default="ReGCN", type=str, help="ReGCN/ReGGNN/Devign")
 
     parser.add_argument("--format", default="uni", type=str,
                         help="idx for index-focused method, uni for unique token-focused method")
-    parser.add_argument("--window_size", default=3, type=int, help="window_size to build graph")
-    parser.add_argument("--remove_residual", default=False, action='store_true', help="remove_residual")
-    parser.add_argument("--att_op", default='mul', type=str,
-                        help="using attention operation for attention: mul, sum, concat")
+    # parser.add_argument("--window_size", default=3, type=int, help="window_size to build graph")
+    # parser.add_argument("--remove_residual", default=False, action='store_true', help="remove_residual")
+    # parser.add_argument("--att_op", default='mul', type=str,
+    #                     help="using attention operation for attention: mul, sum, concat")
     parser.add_argument("--training_percent", default=1., type=float, help="percent of training sample")
-    parser.add_argument("--alpha_weight", default=1., type=float, help="percent of training sample")
-    parser.add_argument("--log_neptune", default=False, action='store_true')
-    parser.add_argument('--early_stopping_metric', type=str, default='macro_f1')
+    parser.add_argument('--early_stopping_metric', type=str, default='mcc')
     parser.add_argument('--max_early_stopping', type=int, default=5)
+    parser.add_argument("--log_neptune", default=False, action='store_true')
 
     args = parser.parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.n_gpu = torch.cuda.device_count()
 
     # logs
     run = None
@@ -818,63 +740,20 @@ def main():
             api_token="",
         )
 
-    # Setup distant debugging if needed
-    if args.server_ip and args.server_port:
-        # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
-        import ptvsd
-        print("Waiting for debugger attach")
-        ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
-        ptvsd.wait_for_attach()
-
-    # Setup CUDA, GPU & distributed training
-    if args.local_rank == -1 or args.no_cuda:
-        device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-        args.n_gpu = torch.cuda.device_count()
-    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
-        torch.distributed.init_process_group(backend='nccl')
-        args.n_gpu = 1
-
     args.device = device
-    args.per_gpu_train_batch_size = args.train_batch_size // max(args.n_gpu, 1)
-    args.per_gpu_eval_batch_size = args.eval_batch_size // max(args.n_gpu, 1)
     # Setup logging
     logging.basicConfig(
         format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
         datefmt='%m/%d/%Y %H:%M:%S',
-        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN
+        level=logging.INFO
     )
-    logger.warning(
-        "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
-        args.local_rank, device, args.n_gpu,
-        bool(args.local_rank != -1),
-        args.fp16
-    )
+    logger.warning("device: %s, n_gpu: %s", device, args.n_gpu)
 
     # Set seed
     set_seed(args.seed)
 
-    # Load pretrained model and tokenizer
-    if args.local_rank not in [-1, 0]:
-        torch.distributed.barrier()  # Barrier to make sure only the first process in distributed training download model & vocab
-
     args.start_epoch = 0
     args.start_step = 0
-    checkpoint_last = os.path.join(args.output_dir, 'checkpoint-last')
-    if os.path.exists(checkpoint_last) and os.listdir(checkpoint_last):
-        args.model_name_or_path = os.path.join(checkpoint_last, 'pytorch_model.bin')
-        args.config_name = os.path.join(checkpoint_last, 'config.json')
-        idx_file = os.path.join(checkpoint_last, 'idx_file.txt')
-        with open(idx_file, encoding='utf-8') as idxf:
-            args.start_epoch = int(idxf.readlines()[0].strip()) + 1
-
-        step_file = os.path.join(checkpoint_last, 'step_file.txt')
-        if os.path.exists(step_file):
-            with open(step_file, encoding='utf-8') as stepf:
-                args.start_step = int(stepf.readlines()[0].strip())
-
-        logger.info("reload model from {}, resume from {} epoch".format(checkpoint_last, args.start_epoch))
 
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     config = config_class.from_pretrained(
@@ -900,22 +779,13 @@ def main():
     else:
         model = model_class(config)
 
-    if args.local_rank == 0:
-        torch.distributed.barrier()  # End of barrier to make sure only the first process in distributed training download model & vocab
-
     logger.info("Training/evaluation parameters %s", args)
 
     # Training
     if args.do_train:
-        if args.local_rank not in [-1, 0]:
-            torch.distributed.barrier()  # Barrier to make sure only the first process in distributed training process the dataset, and the others will use the cache
-
         logger.info("Initializing training dataset")
         train_dataset = TextDataset(tokenizer, args, args.train_data_file, args.training_percent)
-        if args.local_rank == 0:
-            torch.distributed.barrier()
 
-        # train(args, train_dataset, model, tokenizer)
         tune_params = {
             "learning_rate": tune.loguniform(5e-4, 1e-1),
             # "batch_sizes": tune.choice(tune_batch_sizes),

@@ -1,6 +1,6 @@
 services:
   regvd:
-    build: .
+    build: graph
     image: graph:latest
     ports:
       - "8265:8265"

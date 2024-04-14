@@ -73,7 +73,12 @@ class GNNReGVD(nn.Module):
                              residual=not args.remove_residual,
                              att_op=tune_params["att_op"])
         gnn_out_dim = self.gnn.out_dim
-        self.classifier = PredictionClassification(tune_params, config, args, input_size=gnn_out_dim)
+        self.classifier = PredictionClassification(
+            tune_params,
+            config,
+            args,
+            input_size=gnn_out_dim
+        )
 
     def forward(self, input_ids=None, labels=None):
         # construct graph
@@ -84,8 +89,11 @@ class GNNReGVD(nn.Module):
                 window_size=self.tune_params["window_size"]
             )
         else:
-            adj, x_feature = build_graph_text(input_ids.cpu().detach().numpy(), self.w_embeddings,
-                                              window_size=self.tune_params["window_size"])
+            adj, x_feature = build_graph_text(
+                input_ids.cpu().detach().numpy(),
+                self.w_embeddings,
+                window_size=self.tune_params["window_size"]
+            )
         # initilizatioin
         adj, adj_mask = preprocess_adj(adj)
         adj_feature = preprocess_features(x_feature)
@@ -128,12 +136,13 @@ class DevignModel(nn.Module):
         self.w_embeddings = self.encoder.roberta.embeddings.word_embeddings.weight.data.cpu().detach().clone().numpy()
         self.tokenizer = tokenizer
 
-        self.gnn = GGGNN(feature_dim_size=args.feature_dim_size,
-                         hidden_size=tune_params["hidden_size"],
-                         num_GNN_layers=tune_params["num_GNN_layers"],
-                         # num_classes=args.num_classes,
-                         dropout=config.hidden_dropout_prob
-                         )
+        self.gnn = GGGNN(
+            feature_dim_size=args.feature_dim_size,
+            hidden_size=tune_params["hidden_size"],
+            num_GNN_layers=tune_params["num_GNN_layers"],
+            # num_classes=args.num_classes,
+            dropout=config.hidden_dropout_prob
+        )
 
         self.conv_l1 = torch.nn.Conv1d(tune_params["hidden_size"], tune_params["hidden_size"], 3).double()
         self.maxpool1 = torch.nn.MaxPool1d(3, stride=2).double()

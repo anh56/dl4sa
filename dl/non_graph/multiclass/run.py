@@ -5,14 +5,18 @@ import time
 import argparse
 import logging
 import os
+import random
 
-from neptune.utils import stringify_unsupported
-from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler
-from torch.utils.data.distributed import DistributedSampler
-import json
+import numpy as np
+import torch
 from sklearn import metrics
-from tqdm import tqdm
+from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler, TensorDataset
+import json
 
+from tqdm import tqdm, trange
+from model import Model, CodeBERT, Model_CNN, Model_LSTM
+from transformers import (WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,
+                          RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer)
 
 import multiprocessing
 from model import *
@@ -20,28 +24,8 @@ import ray
 from ray import tune
 from ray import train as ray_train
 from ray.tune.schedulers import ASHAScheduler
-import neptune
-from neptune_pytorch import NeptuneLogger
-
-cpu_cont = multiprocessing.cpu_count()
-from transformers import (
-    WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,
-    BertConfig, BertForMaskedLM, BertTokenizer,
-    GPT2Config, GPT2LMHeadModel, GPT2Tokenizer,
-    OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer,
-    RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer,
-    DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer
-)
 
 logger = logging.getLogger(__name__)
-
-MODEL_CLASSES = {
-    'gpt2': (GPT2Config, GPT2LMHeadModel, GPT2Tokenizer),
-    'openai-gpt': (OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer),
-    'bert': (BertConfig, BertForMaskedLM, BertTokenizer),
-    'roberta': (RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer),
-    'distilbert': (DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer)
-}
 
 # enable ray
 ray.init(
@@ -76,12 +60,7 @@ def convert_examples_to_features(js, tokenizer, args):
     source_ids = tokenizer.convert_tokens_to_ids(source_tokens)
     padding_length = args.block_size - len(source_ids)
     source_ids += [tokenizer.pad_token_id] * padding_length
-    return InputFeatures(
-        source_tokens,
-        source_ids,
-        js['idx'],
-        js[args.target_class]
-    )
+    return InputFeatures(source_tokens, source_ids, js['idx'], js[args.target_class])
 
 
 class TextDataset(Dataset):
@@ -130,33 +109,23 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
 
 
-def train(tune_params, config, args, train_dataset, model, tokenizer,
-          run=None, npt_logger=None, log_neptune=False, ):
+def train(tune_params, config, args, train_dataset, model, tokenizer):
     """ Train the model """
 
-    if args.model == "devign":
-        model = DevignModel(tune_params, model, config, tokenizer, args)
+    if args.model == "cnn":
+        model = Model_CNN(tune_params, model, config, tokenizer, args)
+
+    elif args.model == "lstm":
+        model = Model_LSTM(tune_params, model, config, tokenizer, args)
+
     else:
-        model = GNNReGVD(tune_params, model, config, tokenizer, args)
+        config.num_labels = args.num_classes
+        model = CodeBERT(tune_params, model, config, tokenizer, args)
+
     print(model)
     model.to(args.device)
 
-    if log_neptune:
-        run['args'] = args
-        npt_logger = NeptuneLogger(
-            run=run,
-            model=model,
-            log_model_diagram=True,
-            log_gradients=True,
-            log_parameters=True,
-            log_freq=30,
-        )
-        run[npt_logger.base_namespace]["hyperparams"] = stringify_unsupported(
-            args
-        )
-
-    args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
-    train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+    train_sampler = RandomSampler(train_dataset)
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -182,10 +151,11 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
     ]
 
     optimizer = AdamW(optimizer_grouped_parameters, lr=tune_params["learning_rate"], eps=tune_params["adam_epsilon"])
+    max_steps = len(train_dataloader) * args.num_train_epochs
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=args.max_steps * 0.1,
-        num_training_steps=args.max_steps
+        num_warmup_steps=max_steps * 0.1,
+        num_training_steps=max_steps
     )
 
     # Train!
@@ -193,11 +163,7 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
     logger.info("  Num examples = %d", len(train_dataset))
     logger.info("  Num Epochs = %d", args.num_train_epochs)
     logger.info("  batch size = %d", args.train_batch_size)
-    logger.info("  Total optimization steps = %d", args.max_steps)
-
-    global_step = args.start_step
-    tr_loss, logging_loss, avg_loss, tr_nb, tr_num, train_loss = 0.0, 0.0, 0.0, 0, 0, 0
-
+    logger.info("  Total optimization steps = %d", max_steps)
     metrics_es = f"eval_{args.early_stopping_metric}"
     best_metrics_es = -1.0
     model.zero_grad()
@@ -205,57 +171,27 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
     early_stopping_count = 0
     max_early_stopping_count_epoch = args.max_early_stopping
 
-    for idx in range(args.start_epoch, int(args.num_train_epochs)):
-        logger.info(f"Starting epoch {idx}")
-        tr_num = 0
-        train_loss = 0
-        for step, batch in enumerate(train_dataloader):
-            if step % 100 == 0:
-                logger.info(f"      Starting batch {step} processing")
+    for idx in range(args.num_train_epochs):
+        bar = tqdm(train_dataloader, total=len(train_dataloader))
+        losses = []
+        for step, batch in enumerate(bar):
             inputs = batch[0].to(args.device)
             labels = batch[1].to(args.device)
             model.train()
             loss, logits = model(inputs, labels)
 
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
-
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
-            tr_loss += loss.item()
-            tr_num += 1
-            train_loss += loss.item()
-            if avg_loss == 0:
-                avg_loss = tr_loss
-            avg_loss = round(train_loss / tr_num, 5)
+            losses.append(loss.item())
+            bar.set_description("epoch {} loss {}".format(idx, round(np.mean(losses), 3)))
+            optimizer.step()
+            optimizer.zero_grad()
+            scheduler.step()
 
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                if global_step % 100 == 0:
-                    logger.info(f"      Performing optimization step {global_step}")
-
-                optimizer.step()
-                optimizer.zero_grad()
-                scheduler.step()
-                global_step += 1
-
-                avg_loss = round(np.exp((tr_loss - logging_loss) / (global_step - tr_nb)), 4)
-                if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                    logging_loss = tr_loss
-                    tr_nb = global_step
-
-        avg_loss = round(train_loss / tr_num, 5)
-        logger.info(" epoch {} average loss {}".format(idx, avg_loss))
-
-        if run and npt_logger and log_neptune:
-            run[npt_logger.base_namespace]["epoch/loss"].append(avg_loss)
-
-        logger.info(f"  Running eval over epoch {idx}:")
         results_epoch = evaluate(
-            args, model, tokenizer, True,
-            run, npt_logger, log_neptune, "epoch"
+            args, model, tokenizer
         )
-
         for key, value in results_epoch.items():
             logger.info("  %s = %s", key, round(value, 4))
 
@@ -290,7 +226,7 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
             logger.info(f"  Current best {metrics_es} over epochs: {best_metrics_es}")
 
             if early_stopping_count >= max_early_stopping_count_epoch:
-                logger.info(f"  EARLY STOPPING TRIGGERED, epoch {idx}, optimization step {global_step}")
+                logger.info(f"  EARLY STOPPING TRIGGERED, epoch {idx}")
                 logger.info(f"  Current best {metrics_es} over epochs {best_metrics_es}")
                 break
         logger.info("  " + "*" * 20)
@@ -305,7 +241,7 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
         output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
         model.load_state_dict(torch.load(output_dir))
         model.to(args.device)
-        result = evaluate(args, model, tokenizer, run, npt_logger)
+        result = evaluate(args, model, tokenizer)
         logger.info("***** Eval results *****")
         for key in sorted(result.keys()):
             logger.info("  %s = %s", key, str(round(result[key], 4)))
@@ -315,18 +251,15 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
         output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
         model.load_state_dict(torch.load(output_dir))
         model.to(args.device)
-        # test_result = test(args, model, tokenizer)
-        test_result = test(args, model, tokenizer, run, npt_logger, args.log_neptune)
+        # test(args, model, tokenizer)
+        test_result = test(args, model, tokenizer)
 
         logger.info("***** Test results *****")
         for key in sorted(test_result.keys()):
             logger.info("  %s = %s", key, str(round(test_result[key], 4)))
 
 
-def evaluate(
-        args, model, tokenizer,
-        eval_when_training=False, run=None, npt_logger=None, log_neptune=False, stage="batch"
-):
+def evaluate(args, model, tokenizer):
     eval_output_dir = args.output_dir
 
     eval_dataset = TextDataset(tokenizer, args, args.eval_data_file)
@@ -364,38 +297,26 @@ def evaluate(
         nb_eval_steps += 1
     logits = np.concatenate(logits, 0)
     labels = np.concatenate(labels, 0)
+    preds = logits.argmax(-1)
+    eval_loss = eval_loss / nb_eval_steps
+    perplexity = torch.tensor(eval_loss)
 
     if args.num_classes == 2:
-        preds = logits[:, 0] > 0.5
-        preds_for_metrics = list(map(int, list(preds)))
-
         eval_acc = np.mean(labels == preds)
-        eval_loss = eval_loss / nb_eval_steps
-        perplexity = torch.tensor(eval_loss)
-
-        eval_acc_metric = metrics.accuracy_score(labels, preds_for_metrics)
-        eval_precision = metrics.precision_score(labels, preds_for_metrics)
-        eval_recall = metrics.recall_score(labels, preds_for_metrics)
-        eval_f1 = metrics.f1_score(labels, preds_for_metrics)
+        eval_acc_metric = metrics.accuracy_score(labels, preds)
+        eval_precision = metrics.precision_score(labels, preds)
+        eval_recall = metrics.recall_score(labels, preds)
+        eval_f1 = metrics.f1_score(labels, preds)
         eval_f1_macro = eval_f1
-
     else:
-        # Choose the class with the highest probability as prediction
-        preds = np.argmax(logits, axis=1)
-        preds_for_metrics = preds.tolist()
-
         eval_acc = np.mean(labels == preds)
-        eval_loss = eval_loss / nb_eval_steps
-        perplexity = torch.tensor(eval_loss)
+        eval_acc_metric = metrics.accuracy_score(labels, preds)
+        eval_precision = metrics.precision_score(labels, preds, average="macro")
+        eval_recall = metrics.recall_score(labels, preds, average="macro")
+        eval_f1 = metrics.f1_score(labels, preds)
+        eval_f1_macro = metrics.f1_score(labels, preds, average="macro")
+    eval_mcc = metrics.matthews_corrcoef(labels, preds)
 
-        eval_acc_metric = metrics.accuracy_score(labels, preds_for_metrics)
-        eval_precision = metrics.precision_score(labels, preds_for_metrics, average="macro")
-        eval_recall = metrics.recall_score(labels, preds_for_metrics, average="macro")
-
-        eval_f1 = metrics.f1_score(labels, preds_for_metrics, average="macro")
-        eval_f1_macro = metrics.f1_score(labels, preds_for_metrics, average="macro")
-
-    eval_mcc = metrics.matthews_corrcoef(labels, preds_for_metrics)
     result = {
         "eval_loss": float(perplexity),
         "eval_acc": round(eval_acc, 4),
@@ -406,29 +327,10 @@ def evaluate(
         "eval_f1_macro": eval_f1_macro,
         "eval_mcc": eval_mcc,
     }
-
-    if run and npt_logger and log_neptune:
-        if eval_when_training:
-            run[npt_logger.base_namespace][f"train/{stage}/loss"].append(float(perplexity))
-            run[npt_logger.base_namespace][f"train/{stage}/acc"].append(round(eval_acc, 4))
-            run[npt_logger.base_namespace][f"train/{stage}/acc_metric"].append(eval_acc_metric)
-            run[npt_logger.base_namespace][f"train/{stage}/precision"].append(eval_precision)
-            run[npt_logger.base_namespace][f"train/{stage}/recall"].append(eval_recall)
-            run[npt_logger.base_namespace][f"train/{stage}/f_measure"].append(eval_f1)
-            run[npt_logger.base_namespace][f"train/{stage}/macro_f_measure"].append(eval_f1_macro)
-            run[npt_logger.base_namespace][f"train/{stage}/mcc"].append(eval_mcc)
-        else:
-            run[npt_logger.base_namespace][f"eval/{stage}/loss"].append(float(perplexity))
-            run[npt_logger.base_namespace][f"eval/{stage}/acc"].append(round(eval_acc, 4))
-            run[npt_logger.base_namespace][f"eval/{stage}/acc_metric"].append(eval_acc_metric)
-            run[npt_logger.base_namespace][f"eval/{stage}/precision"].append(eval_precision)
-            run[npt_logger.base_namespace][f"eval/{stage}/recall"].append(eval_recall)
-            run[npt_logger.base_namespace][f"eval/{stage}/f_measure"].append(eval_f1)
-            run[npt_logger.base_namespace][f"eval/{stage}/macro_f_measure"].append(eval_f1_macro)
     return result
 
 
-def test(args, model, tokenizer, run=None, npt_logger=None, log_neptune=False):
+def test(args, model, tokenizer):
     eval_dataset = TextDataset(tokenizer, args, args.test_data_file)
     eval_sampler = SequentialSampler(eval_dataset)
     eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
@@ -449,55 +351,32 @@ def test(args, model, tokenizer, run=None, npt_logger=None, log_neptune=False):
             labels.append(label.cpu().numpy())
 
     logits = np.concatenate(logits, 0)
-    labels = np.concatenate(labels, 0)
+    preds = logits.argmax(-1)
 
     if args.num_classes == 2:
-        preds = logits[:, 0] > 0.5
-        preds_for_metrics = list(map(int, list(preds)))
-
         test_acc = np.mean(labels == preds)
-        # test_loss = eval_loss / nb_eval_steps
-        # perplexity = torch.tensor(eval_loss)
-        test_acc_metric = metrics.accuracy_score(labels, preds_for_metrics)
-        test_precision = metrics.precision_score(labels, preds_for_metrics)
-        test_recall = metrics.recall_score(labels, preds_for_metrics)
-        test_f1 = metrics.f1_score(labels, preds_for_metrics)
+        test_precision = metrics.precision_score(labels, preds)
+        test_recall = metrics.recall_score(labels, preds)
+        test_f1 = metrics.f1_score(labels, preds)
         test_f1_macro = test_f1
     else:
-        # Choose the class with the highest probability as prediction
-        preds = np.argmax(logits, axis=1)
-        preds_for_metrics = preds.tolist()
         test_acc = np.mean(labels == preds)
-        test_acc_metric = metrics.accuracy_score(labels, preds_for_metrics)
-        test_precision = metrics.precision_score(labels, preds_for_metrics, average="macro")
-        test_recall = metrics.recall_score(labels, preds_for_metrics, average="macro")
-        test_f1 = metrics.f1_score(labels, preds_for_metrics)
-        test_f1_macro = metrics.f1_score(labels, preds_for_metrics, average="macro")
-    test_mcc = metrics.matthews_corrcoef(labels, preds_for_metrics)
-
+        test_precision = metrics.precision_score(labels, preds, average="macro")
+        test_recall = metrics.recall_score(labels, preds, average="macro")
+        test_f1 = metrics.f1_score(labels, preds)
+        test_f1_macro = metrics.f1_score(labels, preds, average="macro")
+    test_mcc = metrics.matthews_corrcoef(labels, preds)
     with open(os.path.join(args.output_dir, "predictions.txt"), 'w') as f:
         for example, pred in zip(eval_dataset.examples, preds):
-            f.write(example.idx + f'\t{pred}\n')
-
+            f.write(example.idx + f'\t{str(pred)}\n')
     result = {
         "test_acc": round(test_acc, 4),
-        "test_acc_metric": test_acc_metric,
         "test_precision": test_precision,
         "test_recall": test_recall,
         "test_f1": test_f1,
         "test_f1_macro": test_f1_macro,
         "test_mcc": test_mcc
     }
-
-    if run and npt_logger and log_neptune:
-        run[npt_logger.base_namespace]["test/acc"] = test_acc
-        run[npt_logger.base_namespace]["test/acc_metric"] = test_acc_metric
-        run[npt_logger.base_namespace]["test/precision"] = test_precision
-        run[npt_logger.base_namespace]["test/recall"] = test_recall
-        run[npt_logger.base_namespace]["test/f1"] = test_f1
-        run[npt_logger.base_namespace]["test/f1_macro"] = test_f1_macro
-        run[npt_logger.base_namespace]["test/mcc"] = test_mcc
-
     return result
 
 
@@ -515,20 +394,12 @@ def main():
                         help="An optional input evaluation data file to evaluate the perplexity on (a text file).")
     parser.add_argument("--test_data_file", default="../input/test.jsonl", type=str,
                         help="An optional input evaluation data file to evaluate the perplexity on (a text file).")
-    parser.add_argument("--model_type", default="roberta", type=str,
-                        help="The model architecture to be fine-tuned.")
-    parser.add_argument("--model_name_or_path", default="microsoft/codebert-base", type=str,
+    parser.add_argument("--tokenizer_name", default="microsoft/codebert-base", type=str,
                         help="The model checkpoint for weights initialization.")
-    parser.add_argument("--config_name", default="", type=str,
-                        help="Optional pretrained config name or path if not the same as model_name_or_path")
     parser.add_argument("--tokenizer_name", default="microsoft/codebert-base", type=str,
                         help="Optional pretrained tokenizer name or path if not the same as model_name_or_path")
-    parser.add_argument("--cache_dir", default="", type=str,
-                        help="Optional directory to store the pre-trained models downloaded from s3 (instread of the default one)")
     parser.add_argument("--block_size", default=-1, type=int,
-                        help="Optional input sequence length after tokenization."
-                             "The training dataset will be truncated in block of this size for training."
-                             "Default to the model max input length for single sentence inputs (take into account special tokens).")
+                        help="Optional input sequence length after tokenization.")
     parser.add_argument("--do_train", action='store_true',
                         help="Whether to run training.")
     parser.add_argument("--do_eval", action='store_true',
@@ -547,52 +418,23 @@ def main():
     #                     help="Epsilon for Adam optimizer.")
     # parser.add_argument("--max_grad_norm", default=1.0, type=float,
     #                     help="Max gradient norm.")
-    parser.add_argument("--num_train_epochs", default=1.0, type=float,
-                        help="Total number of training epochs to perform.")
-    parser.add_argument("--max_steps", default=-1, type=int,
-                        help="If > 0: set total number of training steps to perform. Override num_train_epochs.")
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
-    parser.add_argument('--epoch', type=int, default=42,
-                        help="random seed for initialization")
-    parser.add_argument("--model", default="GNNs", type=str, help="")
-    # parser.add_argument("--hidden_size", default=256, type=int,
-    #                     help="hidden size.")
-    # parser.add_argument("--feature_dim_size", default=768, type=int,
-    #                     help="feature dim size.")
-    # parser.add_argument("--num_GNN_layers", default=2, type=int,
-    #                     help="num GNN layers.")
-    parser.add_argument("--num_classes", type=int, help="num classes.")
-    parser.add_argument("--target_class", type=str, help="target of classification.")
-    parser.add_argument("--gnn", default="ReGCN", type=str, help="ReGCN/ReGGNN/Devign")
-
-    parser.add_argument("--format", default="uni", type=str,
-                        help="idx for index-focused method, uni for unique token-focused method")
-    # parser.add_argument("--window_size", default=3, type=int, help="window_size to build graph")
-    # parser.add_argument("--remove_residual", default=False, action='store_true', help="remove_residual")
-    # parser.add_argument("--att_op", default='mul', type=str,
-    #                     help="using attention operation for attention: mul, sum, concat")
+    parser.add_argument('--num_train_epochs', type=int, default=42,
+                        help="num_train_epochs")
+    parser.add_argument('--num_classes', type=int, default=3,
+                        help="number of classes")
+    parser.add_argument('--target_class', type=str,
+                        help="the vul class to classiify")
+    parser.add_argument('--model', type=str,
+                        help="the target model to be used")
     parser.add_argument("--training_percent", default=1., type=float, help="percent of training sample")
     parser.add_argument('--early_stopping_metric', type=str, default='mcc')
     parser.add_argument('--max_early_stopping', type=int, default=5)
-    parser.add_argument("--log_neptune", default=False, action='store_true')
 
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.n_gpu = torch.cuda.device_count()
-
-    # logs
-    run = None
-    npt_logger = None
-
-    if args.log_neptune:
-        print("custom_run_id", f'm{args.model}_e{args.epoch}_t{hex(int(time.time()))[2:]}')
-        run = neptune.init_run(
-            name=f"m{args.model}_e{args.epoch}_t{datetime.now().strftime('%d_%m_%Y_%H_%M')}",
-            custom_run_id=f"m{args.model}_e{args.epoch}_t{hex(int(time.time()))[2:]}",
-            project="",
-            api_token="",
-        )
 
     args.device = device
     # Setup logging
@@ -606,32 +448,19 @@ def main():
     # Set seed
     set_seed(args.seed)
 
-    args.start_epoch = 0
-    args.start_step = 0
+    config = RobertaConfig.from_pretrained(args.model_name_or_path)
 
-    config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-    config = config_class.from_pretrained(
-        args.config_name if args.config_name else args.model_name_or_path,
-        cache_dir=args.cache_dir if args.cache_dir else None
-    )
-    config.num_labels = 1
-    tokenizer = tokenizer_class.from_pretrained(
-        args.tokenizer_name,
-        do_lower_case=args.do_lower_case,
-        cache_dir=args.cache_dir if args.cache_dir else None
-    )
+    print("config", config)
+    tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name)
+
     if args.block_size <= 0:
-        args.block_size = tokenizer.max_len_single_sentence  # Our input block size will be the max possible for the model
+        args.block_size = tokenizer.max_len_single_sentence
     args.block_size = min(args.block_size, tokenizer.max_len_single_sentence)
-    if args.model_name_or_path:
-        model = model_class.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool('.ckpt' in args.model_name_or_path),
-            config=config,
-            cache_dir=args.cache_dir if args.cache_dir else None
-        )
-    else:
-        model = model_class(config)
+
+    # output the same dimension for the encoder's classifier
+    # allow us to reuse this for the custom classifier
+    config.num_labels = config.hidden_size
+    model = RobertaForSequenceClassification.from_pretrained(args.model_name_or_path, config=config)
 
     logger.info("Training/evaluation parameters %s", args)
 
@@ -642,15 +471,11 @@ def main():
 
         tune_params = {
             "learning_rate": tune.loguniform(5e-4, 1e-1),
-            # "batch_sizes": tune.choice(tune_batch_sizes),
-            # "weight_decays": tune.choice(tune_weight_decays),
-            # "dropout_rates": tune.choice(tune_dropout_rates),
-            # "feature_dim_size": tune.choice([768, 1024, 2048]),
-            "hidden_size": tune.choice([32, 64, 128, 256, 512]),
-            "num_GNN_layers": tune.choice([1, 2, 3, 4, 5]),
-            "att_op": tune.choice(["mul", "sum", "concat"]),
-            "window_size": tune.choice([1, 3, 5, 7, 9]),
             "adam_epsilon": tune.loguniform(1e-8, 1e-4),
+            "hidden_size": tune.choice([32, 64, 128, 256, 512]),
+            "kernel_size": tune.choce([1, 3, 5, 7, 9]),
+            "padding_size": tune.choice([0, 1, 2, 3]),
+            "num_layers": tune.choice([1, 2, 3])
         }
 
         scheduler = ASHAScheduler(
@@ -668,9 +493,6 @@ def main():
                     train_dataset=train_dataset,
                     model=model,
                     tokenizer=tokenizer,
-                    # run=run,
-                    # npt_logger=npt_logger,
-                    log_neptune=args.log_neptune
                 ),
                 resources={"cpu": 16, "gpu": 1}
             ),
