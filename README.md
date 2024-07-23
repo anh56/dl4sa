@@ -1,4 +1,4 @@
-# dl4sa
+# Deep Learning for Code-centric Software Vulnerability Assessment
 
 This repository contains the data and scripts used in the paper "Automated Code-centric Software Vulnerability Assessment: How Far Are We? An Empirical Study in C/C++".
 
