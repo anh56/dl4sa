@@ -26,4 +26,12 @@ Each model is provided in a separate folder, and contains a `README.md` file tha
 
 
 ## Citation
-TBA
+```
+@inproceedings{nguyen2024automated,
+  title={Automated Code-centric Software Vulnerability Assessment: How Far Are We? An Empirical Study in C/C++},
+  author={Nguyen, Anh The and Le, Triet Huynh Minh and Babar, M Ali},
+  booktitle={Proceedings of the 18th ACM/IEEE International Symposium on Empirical Software Engineering and Measurement},
+  pages={72--83},
+  year={2024}
+}
+```
