@@ -11,7 +11,7 @@ import shutil
 import numpy as np
 import scipy
 import torch
-from neptune.utils import stringify_unsupported
+# from neptune.utils import stringify_unsupported
 from sklearn import metrics
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
@@ -23,18 +23,20 @@ import ray
 from ray import tune
 from ray import train as ray_train
 from ray.tune.schedulers import ASHAScheduler
-import neptune
-from neptune_pytorch import NeptuneLogger
+
+# import neptune
+# from neptune_pytorch import NeptuneLogger
 
 cpu_cont = multiprocessing.cpu_count()
 from transformers import (
-    WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,
+    WEIGHTS_NAME, get_linear_schedule_with_warmup,
     BertConfig, BertForMaskedLM, BertTokenizer,
     GPT2Config, GPT2LMHeadModel, GPT2Tokenizer,
     OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer,
     RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer,
     DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer
 )
+from torch.optim import AdamW
 
 logger = logging.getLogger(__name__)
 
@@ -46,24 +48,25 @@ MODEL_CLASSES = {
     'distilbert': (DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer)
 }
 
+
 # enable ray
-ray.init(
-    num_gpus=1,
-    # dashboard_port=8265,
-    # dashboard_host="0.0.0.0",
-    # include_dashboard=True
-)
+# ray.init(
+#     num_gpus=1,
+#     # dashboard_port=8265,
+#     # dashboard_host="0.0.0.0",
+#     # include_dashboard=True
+# )
 
 
 class InputFeatures(object):
     """A single training/test features for an example."""
 
     def __init__(
-            self,
-            input_tokens,
-            input_ids,
-            idx,
-            label,
+        self,
+        input_tokens,
+        input_ids,
+        idx,
+        label,
     ):
         self.input_tokens = input_tokens
         self.input_ids = input_ids
@@ -73,11 +76,11 @@ class InputFeatures(object):
 
 class MultitaskInputFeatures(object):
     def __init__(
-            self,
-            input_tokens,
-            input_ids,
-            idx,
-            labels,
+        self,
+        input_tokens,
+        input_ids,
+        idx,
+        labels,
     ):
         self.input_tokens = input_tokens
         self.input_ids = input_ids
@@ -87,12 +90,38 @@ class MultitaskInputFeatures(object):
 
 def convert_examples_to_features(js, tokenizer, args):
     # source
-    code = ' '.join(js['func'].split())
-    code_tokens = tokenizer.tokenize(code)[:args.block_size - 2]
-    source_tokens = [tokenizer.cls_token] + code_tokens + [tokenizer.sep_token]
-    source_ids = tokenizer.convert_tokens_to_ids(source_tokens)
-    padding_length = args.block_size - len(source_ids)
-    source_ids += [tokenizer.pad_token_id] * padding_length
+    # code = ' '.join(js['func'].split())
+    # code_tokens = tokenizer.tokenize(code)[:args.block_size - 2]
+    # source_tokens = [tokenizer.cls_token] + code_tokens + [tokenizer.sep_token]
+    # source_ids = tokenizer.convert_tokens_to_ids(source_tokens)
+    # padding_length = args.block_size - len(source_ids)
+    # source_ids += [tokenizer.pad_token_id] * padding_length
+    special_tokens_to_add = {}
+    mandatory_tokens = {
+        "unk_token": "<unk>",
+        "pad_token": "<pad>",
+        "cls_token": "<s>",
+        "sep_token": "</s>",
+        "bos_token": "<s>",
+        "eos_token": "</s>",
+        "mask_token": "<mask>",
+    }
+
+    for token_name, token_value in mandatory_tokens.items():
+        if getattr(tokenizer, token_name, None) is None:
+            # Set the public property only
+            setattr(tokenizer, token_name, token_value)
+
+    encoded = tokenizer(
+        js["func"],
+        add_special_tokens=True,  # adds <s> and </s> for RoBERTa
+        max_length=args.block_size,
+        truncation=True,
+        padding="max_length"  # pads to block_size automatically
+    )
+
+    source_ids = encoded["input_ids"]
+    source_tokens = tokenizer.convert_ids_to_tokens(source_ids)
 
     # specify the number of labels for each class
     # authentication only have 2 labels
@@ -151,7 +180,7 @@ class TextDataset(Dataset):
 
 
 def eval_metrics_per_class(
-        run, npt_logger, log_neptune, namespace, accs, precs, recs, f1s, f1_macros, mccs
+    run, npt_logger, log_neptune, namespace, accs, precs, recs, f1s, f1_macros, mccs
 ):
     target_cols = [
         "access_vector", "access_complexity", "authentication",
@@ -170,7 +199,7 @@ def eval_metrics_per_class(
 
 def set_seed(seed=42):
     random.seed(seed)
-    os.environ['PYHTONHASHSEED'] = str(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -202,7 +231,7 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
             args
         )
 
-    args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
+    args.train_batch_size = 128 * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
 
     train_dataloader = DataLoader(
@@ -374,8 +403,8 @@ def train(tune_params, config, args, train_dataset, model, tokenizer,
 
 
 def evaluate(
-        args, model, tokenizer,
-        eval_when_training=False, run=None, npt_logger=None, log_neptune=False, stage="batch"
+    args, model, tokenizer,
+    eval_when_training=False, run=None, npt_logger=None, log_neptune=False, stage="batch"
 ):
     eval_output_dir = args.output_dir
 
@@ -447,7 +476,7 @@ def evaluate(
     eval_recall = np.mean(recs)
 
     f1s = [
-        metrics.f1_score(true, pred)
+        metrics.f1_score(true, pred, average="micro")
         for true, pred in zip(labels, preds)]
     eval_f1 = np.mean(f1s)
 
@@ -580,7 +609,7 @@ def test(args, model, tokenizer, run=None, npt_logger=None, log_neptune=False):
     test_recall = np.mean(recs)
 
     f1s = [
-        metrics.f1_score(true, pred)
+        metrics.f1_score(true, pred, average="micro")
         for true, pred in zip(labels, preds)]
     test_f1 = np.mean(f1s)
 
@@ -601,7 +630,7 @@ def test(args, model, tokenizer, run=None, npt_logger=None, log_neptune=False):
 
     with open(os.path.join(args.output_dir, "predictions.txt"), 'w') as f:
         for example, pred in zip(
-                eval_dataset.examples, zip(*preds)
+            eval_dataset.examples, zip(*preds)
         ):  # Unpack preds so each pred is a tuple of class predictions
             class_labels = [np.argmax(p) for p in pred]
             f.write(f"{example.idx},{','.join(map(str, class_labels))}\n")  # Write example id and all class predictions
@@ -685,14 +714,14 @@ def main():
                         help="Batch size per GPU/CPU for training.")
     parser.add_argument("--eval_batch_size", default=4, type=int,
                         help="Batch size per GPU/CPU for evaluation.")
-    # parser.add_argument("--learning_rate", default=5e-5, type=float,
-    #                     help="The initial learning rate for Adam.")
-    # parser.add_argument("--weight_decay", default=0.0, type=float,
-    #                     help="Weight decay if we apply some.")
-    # parser.add_argument("--adam_epsilon", default=1e-8, type=float,
-    #                     help="Epsilon for Adam optimizer.")
-    # parser.add_argument("--max_grad_norm", default=1.0, type=float,
-    #                     help="Max gradient norm.")
+    parser.add_argument("--learning_rate", default=5e-5, type=float,
+                        help="The initial learning rate for Adam.")
+    parser.add_argument("--weight_decay", default=0.0, type=float,
+                        help="Weight decay if we apply some.")
+    parser.add_argument("--adam_epsilon", default=1e-8, type=float,
+                        help="Epsilon for Adam optimizer.")
+    parser.add_argument("--max_grad_norm", default=1.0, type=float,
+                        help="Max gradient norm.")
     parser.add_argument("--num_train_epochs", default=1.0, type=float,
                         help="Total number of training epochs to perform.")
     parser.add_argument("--max_steps", default=-1, type=int,
@@ -702,43 +731,46 @@ def main():
     parser.add_argument('--epoch', type=int, default=42,
                         help="random seed for initialization")
     parser.add_argument("--model", default="GNNs", type=str, help="")
-    # parser.add_argument("--hidden_size", default=256, type=int,
-    #                     help="hidden size.")
-    # parser.add_argument("--feature_dim_size", default=768, type=int,
-    #                     help="feature dim size.")
-    # parser.add_argument("--num_GNN_layers", default=2, type=int,
-    #                     help="num GNN layers.")
-    # parser.add_argument("--num_classes", default=2, type=int,
-    #                     help="num classes.")
+    parser.add_argument("--hidden_size", default=256, type=int,
+                        help="hidden size.")
+    parser.add_argument("--feature_dim_size", default=768, type=int,
+                        help="feature dim size.")
+    parser.add_argument("--num_GNN_layers", default=2, type=int,
+                        help="num GNN layers.")
+    parser.add_argument("--num_classes", default=2, type=int,
+                        help="num classes.")
     parser.add_argument("--gnn", default="ReGCN", type=str, help="ReGCN/ReGGNN/Devign")
 
     parser.add_argument("--format", default="uni", type=str,
                         help="idx for index-focused method, uni for unique token-focused method")
-    # parser.add_argument("--window_size", default=3, type=int, help="window_size to build graph")
-    # parser.add_argument("--remove_residual", default=False, action='store_true', help="remove_residual")
-    # parser.add_argument("--att_op", default='mul', type=str,
-    #                     help="using attention operation for attention: mul, sum, concat")
+    parser.add_argument("--window_size", default=3, type=int, help="window_size to build graph")
+    parser.add_argument("--remove_residual", default=False, action='store_true', help="remove_residual")
+    parser.add_argument("--att_op", default='mul', type=str,
+                        help="using attention operation for attention: mul, sum, concat")
     parser.add_argument("--training_percent", default=1., type=float, help="percent of training sample")
     parser.add_argument('--early_stopping_metric', type=str, default='mcc')
     parser.add_argument('--max_early_stopping', type=int, default=5)
     parser.add_argument("--log_neptune", default=False, action='store_true')
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of updates steps to accumulate before performing a backward/update pass.")
 
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.n_gpu = torch.cuda.device_count()
+    args.local_rank = -1
 
     # logs
     run = None
     npt_logger = None
 
-    if args.log_neptune:
-        print("custom_run_id", f'm{args.model}_e{args.epoch}_t{hex(int(time.time()))[2:]}')
-        run = neptune.init_run(
-            name=f"m{args.model}_e{args.epoch}_t{datetime.now().strftime('%d_%m_%Y_%H_%M')}",
-            custom_run_id=f"m{args.model}_e{args.epoch}_t{hex(int(time.time()))[2:]}",
-            project="",
-            api_token="",
-        )
+    # if args.log_neptune:
+    #     print("custom_run_id", f'm{args.model}_e{args.epoch}_t{hex(int(time.time()))[2:]}')
+    #     run = neptune.init_run(
+    #         name=f"m{args.model}_e{args.epoch}_t{datetime.now().strftime('%d_%m_%Y_%H_%M')}",
+    #         custom_run_id=f"m{args.model}_e{args.epoch}_t{hex(int(time.time()))[2:]}",
+    #         project="",
+    #         api_token="",
+    #     )
 
     args.device = device
     # Setup logging
@@ -758,13 +790,16 @@ def main():
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
     config = config_class.from_pretrained(
         args.config_name if args.config_name else args.model_name_or_path,
-        cache_dir=args.cache_dir if args.cache_dir else None
+        cache_dir=args.cache_dir if args.cache_dir else None,
+        force_download=True,
+        attn_implementation="eager",
     )
     config.num_labels = 1
     tokenizer = tokenizer_class.from_pretrained(
         args.tokenizer_name,
-        do_lower_case=args.do_lower_case,
-        cache_dir=args.cache_dir if args.cache_dir else None
+        cache_dir=args.cache_dir if args.cache_dir else None,
+        force_download=True,
+        attn_implementation="eager",
     )
     if args.block_size <= 0:
         args.block_size = tokenizer.max_len_single_sentence  # Our input block size will be the max possible for the model
@@ -791,7 +826,7 @@ def main():
             # "batch_sizes": tune.choice(tune_batch_sizes),
             # "weight_decays": tune.choice(tune_weight_decays),
             # "dropout_rates": tune.choice(tune_dropout_rates),
-            # "feature_dim_size": tune.choice([768, 1024, 2048]),
+            "feature_dim_size": tune.choice([768, 1024, 2048]),
             "hidden_size": tune.choice([32, 64, 128, 256, 512]),
             "num_GNN_layers": tune.choice([1, 2, 3, 4, 5]),
             "att_op": tune.choice(["mul", "sum", "concat"]),
@@ -824,8 +859,8 @@ def main():
                 metric=args.early_stopping_metric,
                 mode="max",
                 scheduler=scheduler,
-                num_samples=10,
-                max_concurrent_trials=1
+                num_samples=16,
+                max_concurrent_trials=8,
             ),
             param_space=tune_params,
         )

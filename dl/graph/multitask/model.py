@@ -122,7 +122,7 @@ class GNNReGVD(nn.Module):
         outputs = self.gnn(adj_feature.to(device).double(), adj.to(device).double(), adj_mask.to(device).double())
 
         logits = self.classifier(outputs)  # logits is a list of tensors
-        prob = [torch.softmax(logit) for logit in logits]
+        prob = [torch.sigmoid(logit) for logit in logits]
 
         if labels_list is not None:
             loss = 0
@@ -216,7 +216,7 @@ class DevignModel(nn.Module):
             avg = before_avg.mean(dim=1)
             logits.append(avg)
 
-        prob = [torch.softmax(logit) for logit in logits]
+        prob = [torch.sigmoid(logit) for logit in logits]
 
         if labels_list is not None:
             loss = 0
